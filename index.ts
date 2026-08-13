@@ -1,5 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
+import {
+	accessSync,
+	constants as fsConstants,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,7 +48,7 @@ type JsonRpcResponse<TResult = unknown> = {
 	error?: { code: number; message: string; data?: unknown };
 };
 
-type LuaConfig = {
+type McpConfig = {
 	command: string[];
 	environment?: Record<string, string>;
 };
@@ -53,11 +60,14 @@ type McpTool = {
 	annotations?: Record<string, unknown>;
 };
 
-// Calculate extension name from the current file's directory
+// Calculate the extension name from the current file's directory
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const EXTENSION_NAME = basename(__dirname);
-const DEFAULT_CONFIG_PATH = resolve(__dirname, "config.json");
+const extensionName = basename(__dirname);
+const EXTENSION_ID = "munray";
+const CONFIG_FILENAME = `pi-${EXTENSION_ID}-extension.conf`;
+const DEFAULT_CONFIG_PATH = resolve(homedir(), ".pi", "agent", CONFIG_FILENAME);
+const CONFIG_TEMPLATE_PATH = resolve(__dirname, `${CONFIG_FILENAME}.template`);
 
 function expandHome(p: string): string {
 	if (p.startsWith("~/")) return resolve(homedir(), p.slice(2));
@@ -80,28 +90,76 @@ function parseFileRef(value: string): { type: "file"; path: string } | null {
 	return { type: "file", path: expandHome(m[1].trim()) };
 }
 
-function loadConfig(path: string): LuaConfig {
+function stripJsonComments(raw: string): string {
+	let result = "";
+	let inString = false;
+	let escaped = false;
+
+	for (let i = 0; i < raw.length; i++) {
+		const char = raw[i];
+		const next = raw[i + 1];
+		if (inString) {
+			result += char;
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			else if (char === '"') inString = false;
+			continue;
+		}
+		if (char === '"') {
+			inString = true;
+			result += char;
+		} else if (char === "/" && next === "/") {
+			while (i < raw.length && raw[i] !== "\n") i++;
+			if (i < raw.length) result += "\n";
+		} else if (char === "/" && next === "*") {
+			i += 2;
+			while (i < raw.length && !(raw[i] === "*" && raw[i + 1] === "/")) {
+				if (raw[i] === "\n") result += "\n";
+				i++;
+			}
+			i++;
+		} else {
+			result += char;
+		}
+	}
+	return result;
+}
+
+function ensureDefaultConfig(): void {
+	if (existsSync(DEFAULT_CONFIG_PATH)) return;
+
+	mkdirSync(dirname(DEFAULT_CONFIG_PATH), { recursive: true });
+	const template = readFileSync(CONFIG_TEMPLATE_PATH, "utf-8");
+	try {
+		// "wx" ensures a config created by another Pi process is never overwritten.
+		writeFileSync(DEFAULT_CONFIG_PATH, template, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+	} catch (error: unknown) {
+		if (!(isRecord(error) && error["code"] === "EEXIST")) throw error;
+	}
+}
+
+function loadConfig(path: string): McpConfig {
 	const abs = expandHome(path);
 	const raw = readFileSync(abs, "utf-8");
-	const data: unknown = JSON.parse(raw);
+	const data: unknown = JSON.parse(stripJsonComments(raw));
 
-	// Accept either { command, environment } or nested { mcp: { lua: { ... } } }
+	// Accept either { command, environment } or a nested MCP server configuration.
 	let cfg: unknown = data;
 	if (isRecord(cfg)) {
 		const mcp = cfg["mcp"];
 		if (isRecord(mcp)) {
-			const lua = mcp["lua"];
-			if (isRecord(lua)) cfg = lua;
+			const serverConfig = mcp[EXTENSION_ID];
+			if (isRecord(serverConfig)) cfg = serverConfig;
 		}
 	}
 
 	if (!isRecord(cfg)) {
-		throw new Error(`Invalid lua config at ${abs}: expected object`);
+		throw new Error(`Invalid ${EXTENSION_ID} config at ${abs}: expected object`);
 	}
 
 	const command = cfg["command"];
 	if (!Array.isArray(command) || command.length === 0 || !command.every((c) => typeof c === "string")) {
-		throw new Error(`Invalid lua config at ${abs}: missing command array`);
+		throw new Error(`Invalid ${EXTENSION_ID} config at ${abs}: missing command array`);
 	}
 
 	const environmentRaw = cfg["environment"];
@@ -144,7 +202,7 @@ class McpStdioClient {
 	private unavailableReason: string | null = null;
 	private lastFatalNotified: string | null = null;
 
-	// When executing a mutating Lua tool, the server may send a truncated code preview in elicitation.message.
+	// When executing a mutating tool, the server may send a truncated code preview in elicitation.message.
 	// We keep the full code here so the approval UI can show an expandable full preview.
 	private pendingMutatingCode: string | null = null;
 
@@ -166,7 +224,7 @@ class McpStdioClient {
 		return !!this.child && !this.child.killed;
 	}
 
-	async start(config: LuaConfig, ctx: ExtensionContext, meta?: { configPath?: string }) {
+	async start(config: McpConfig, ctx: ExtensionContext, meta?: { configPath?: string }) {
 		if (this.isRunning()) return;
 
 		const [cmd, ...args] = config.command;
@@ -179,9 +237,9 @@ class McpStdioClient {
 				accessSync(cmd, fsConstants.X_OK);
 			} catch {
 				const cfgHint = meta?.configPath ? ` (config: ${meta.configPath})` : "";
-				const msg = `lua binary not found or not executable: ${cmd}${cfgHint}. Update your lua config and run /lua-restart.`;
+				const msg = `${EXTENSION_ID} binary not found or not executable: ${cmd}${cfgHint}. Update your ${EXTENSION_ID} config and run /${EXTENSION_ID}-restart.`;
 				this.unavailableReason = msg;
-				ctx.ui.setStatus(EXTENSION_NAME, "lua MCP: unavailable (binary not found)");
+				ctx.ui.setStatus(extensionName, `${EXTENSION_ID} MCP: unavailable (binary not found)`);
 				if (ctx.hasUI && this.lastFatalNotified !== msg) {
 					ctx.ui.notify(msg, "error");
 					this.lastFatalNotified = msg;
@@ -194,7 +252,7 @@ class McpStdioClient {
 		this.child = child;
 
 		child.on("exit", (code, signal) => {
-			const msg = `lua MCP exited (code=${code}, signal=${signal ?? ""})`;
+			const msg = `${EXTENSION_ID} MCP exited (code=${code}, signal=${signal ?? ""})`;
 			this.rejectAllPending(new Error(msg));
 			this.initialized = false;
 			this.initInstructions = null;
@@ -202,7 +260,7 @@ class McpStdioClient {
 			this.mcpTools = [];
 			if (this.child === child) this.child = null;
 			this.unavailableReason = msg;
-			ctx.ui.setStatus(EXTENSION_NAME, "lua MCP: disconnected");
+			ctx.ui.setStatus(extensionName, `${EXTENSION_ID} MCP: disconnected`);
 		});
 
 		child.stdout.setEncoding("utf-8");
@@ -211,7 +269,7 @@ class McpStdioClient {
 		child.stderr.setEncoding("utf-8");
 		child.stderr.on("data", (chunk: string) => {
 			// stderr is for debugging; keep it short in the footer.
-			ctx.ui.setStatus(EXTENSION_NAME, `lua stderr: ${String(chunk).trim().slice(0, 120)}`);
+			ctx.ui.setStatus(extensionName, `${EXTENSION_ID} stderr: ${String(chunk).trim().slice(0, 120)}`);
 		});
 
 		// If spawn fails (ENOENT, permissions, ...), Node emits an 'error' event on ChildProcess.
@@ -249,7 +307,7 @@ class McpStdioClient {
 
 	stop() {
 		if (!this.child) return;
-		this.rejectAllPending(new Error("lua MCP stopped"));
+		this.rejectAllPending(new Error(`${EXTENSION_ID} MCP stopped`));
 		try {
 			this.child.kill();
 		} catch {
@@ -278,7 +336,7 @@ class McpStdioClient {
 		let msg = base;
 		if (code === "ENOENT" || errno === -2) {
 			const cfgHint = configPath ? ` (config: ${configPath})` : "";
-			msg = `lua binary not found: ${cmd}${cfgHint}. Update your lua config and run /lua-restart.`;
+			msg = `${EXTENSION_ID} binary not found: ${cmd}${cfgHint}. Update your ${EXTENSION_ID} config and run /${EXTENSION_ID}-restart.`;
 		}
 
 		this.unavailableReason = msg;
@@ -296,7 +354,7 @@ class McpStdioClient {
 		this.mcpTools = [];
 
 		if (ctx?.hasUI) {
-			ctx.ui.setStatus(EXTENSION_NAME, "lua MCP: unavailable");
+			ctx.ui.setStatus(extensionName, `${EXTENSION_ID} MCP: unavailable`);
 			if (this.lastFatalNotified !== msg) {
 				ctx.ui.notify(msg, "error");
 				this.lastFatalNotified = msg;
@@ -307,11 +365,11 @@ class McpStdioClient {
 	private async initialize(ctx: ExtensionContext) {
 		if (this.initialized) return;
 
-		// Tell lua we support form-mode elicitation so it can request approvals.
+		// Tell the server we support form-mode elicitation so it can request approvals.
 		const initResult = await this.request<Record<string, unknown>>("initialize", {
 			protocolVersion: "2025-11-25",
 			capabilities: { elicitation: { form: {} } },
-			clientInfo: { name: "pi", version: EXTENSION_NAME },
+			clientInfo: { name: "pi", version: extensionName },
 		});
 
 		this.initInstructions =
@@ -331,8 +389,8 @@ class McpStdioClient {
 
 		this.initialized = true;
 		this.mcpTools = await this.listTools();
-		const si = this.serverInfo?.name ? `${this.serverInfo.name}${this.serverInfo.version ? " " + this.serverInfo.version : ""}` : "lua";
-		ctx.ui.setStatus(EXTENSION_NAME, `lua MCP: connected (${si}, ${this.mcpTools.length} tools)`);
+		const si = this.serverInfo?.name ? `${this.serverInfo.name}${this.serverInfo.version ? " " + this.serverInfo.version : ""}` : `${EXTENSION_ID}`;
+		ctx.ui.setStatus(extensionName, `${EXTENSION_ID} MCP: connected (${si}, ${this.mcpTools.length} tools)`);
 	}
 
 	getInstructions(): string | null {
@@ -371,7 +429,7 @@ class McpStdioClient {
 	}
 
 	async request<TResult = unknown, TParams = unknown>(method: string, params?: TParams): Promise<TResult> {
-		if (!this.child) throw new Error("lua MCP not running");
+		if (!this.child) throw new Error(`${EXTENSION_ID} MCP not running`);
 		const id = this.nextId++;
 
 		const req: JsonRpcRequest<TParams> = { jsonrpc: "2.0", id, method, params };
@@ -384,7 +442,7 @@ class McpStdioClient {
 	}
 
 	async notify<TParams = unknown>(method: string, params?: TParams): Promise<void> {
-		if (!this.child) throw new Error("lua MCP not running");
+		if (!this.child) throw new Error(`${EXTENSION_ID} MCP not running`);
 		const req: JsonRpcRequest<TParams> = { jsonrpc: "2.0", method, params };
 		this.child.stdin.write(JSON.stringify(req) + "\n");
 	}
@@ -461,8 +519,8 @@ class McpStdioClient {
 	}
 
 	private parseElicitationMessage(message: string): { text: string; code: string | null } {
-		// lua formats message like:
-		// "Mutating Lua execution requested.\n\nSession: ...\nCode preview:\n<lua>"
+		// The server formats messages like:
+		// `Mutating Extension execution requested.\n\nSession: ...\nCode preview:\n<code>`
 		const lines = message.split("\n");
 		const idx = lines.findIndex(
 			(l) => l.trim().toLowerCase() === "code preview:" || l.trim().startsWith("Code preview:"),
@@ -487,7 +545,7 @@ class McpStdioClient {
 			return;
 		}
 
-		// Custom dialog with formatted message + highlighted Lua code preview.
+		// Custom dialog with formatted message + highlighted Extension code preview.
 		const mdTheme = getMarkdownTheme();
 		const parsedMsg = this.parseElicitationMessage(message);
 		const codeForPanels = this.getPendingMutatingCode() ?? parsedMsg.code;
@@ -495,7 +553,7 @@ class McpStdioClient {
 		// Emit a Pi inter-extension event so other extensions (e.g. a terminal notifier)
 		// can react to approval prompts.
 		try {
-			this._pi.events.emit("lua:elicitation", {
+			this._pi.events.emit(`${EXTENSION_ID}:elicitation`, {
 				phase: "create",
 				requestId: reqId,
 				message: parsedMsg.text,
@@ -528,7 +586,7 @@ class McpStdioClient {
 						const top = border("┌" + "─".repeat(inner) + "┐");
 						const bottom = border("└" + "─".repeat(inner) + "┘");
 
-						const highlighted = highlightCode(code, "lua");
+						const highlighted = highlightCode(code);
 						const rawLines = Array.isArray(highlighted)
 							? highlighted
 							: String(highlighted ?? "").split("\n");
@@ -581,7 +639,7 @@ class McpStdioClient {
 
 			const container = new Container();
 			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-			container.addChild(new Text(theme.fg("accent", theme.bold("lua: approve mutating operation?")), 1, 0));
+			container.addChild(new Text(theme.fg("accent", theme.bold(`${EXTENSION_ID}: approve mutating operation?`)), 1, 0));
 
 			// Message (without code)
 			container.addChild(new Markdown(parsedMsg.text, 1, 0, mdTheme));
@@ -603,7 +661,7 @@ class McpStdioClient {
 						const top = border("┌" + "─".repeat(inner) + "┐");
 						const bottom = border("└" + "─".repeat(inner) + "┘");
 
-						const highlighted = highlightCode(code, "lua");
+						const highlighted = highlightCode(code);
 						const rawLines = Array.isArray(highlighted)
 							? highlighted
 							: String(highlighted ?? "").split("\n");
@@ -661,7 +719,7 @@ class McpStdioClient {
 
 		const emitResolve = (decision: "approve" | "reject" | "cancel") => {
 			try {
-				this._pi.events.emit("lua:elicitation", {
+				this._pi.events.emit(`${EXTENSION_ID}:elicitation`, {
 					phase: "resolve",
 					requestId: reqId,
 					decision,
@@ -700,26 +758,26 @@ function extractTextContent(toolResult: unknown): string {
 	return typeof text === "string" ? text : "";
 }
 
-const luaSchema = Type.Object({
-	code: Type.String({ description: "Lua code to execute" }),
+const toolSchema = Type.Object({
+	code: Type.String({ description: "Code to execute" }),
 	timeout_ms: Type.Optional(Type.Integer({ description: "Optional per-call execution timeout in milliseconds" })),
 	session_id: Type.Optional(Type.String({ description: "Optional session identifier for state reuse" })),
 });
 
-type LuaToolArgs = {
+type McpToolArgs = {
 	code: string;
 	timeout_ms?: number;
 	session_id?: string;
 };
 
-type LuaRenderState = {
+type ToolRenderState = {
 	startedAt?: number;
 	endedAt?: number;
 	interval?: NodeJS.Timeout;
 };
 
-type LuaToolRenderContext = {
-	state: LuaRenderState;
+type ToolRenderContext = {
+	state: ToolRenderState;
 	invalidate: () => void;
 	executionStarted: boolean;
 	isPartial: boolean;
@@ -727,36 +785,37 @@ type LuaToolRenderContext = {
 };
 
 export default function (pi: ExtensionAPI) {
-	pi.registerFlag("lua-config", {
-		description: `Path to lua MCP config JSON (default: ${DEFAULT_CONFIG_PATH})`,
+	pi.registerFlag(`${EXTENSION_ID}-config`, {
+		description: `Path to ${EXTENSION_ID} MCP config JSON (default: ${DEFAULT_CONFIG_PATH})`,
 		type: "string",
 		default: DEFAULT_CONFIG_PATH,
 	});
 
 	const client = new McpStdioClient(pi);
-	let config: LuaConfig | null = null;
+	let config: McpConfig | null = null;
 	let configPathUsed: string | null = null;
 	let currentSessionId: string | null = null;
-	let luaInstructions: string | null = null;
+	let serverInstructions: string | null = null;
 	const registeredToolNames = new Set<string>();
 
 	// Controls how much code we show in the read-only tool call renderer.
-	// Toggled via /lua-toggle-preview.
+	// Toggled via the preview command.
 	let showReadOnlyFullPreview = false;
 
-	// Controls whether the *UI* shows lua tool results/output.
+	// Controls whether the *UI* shows tool results/output.
 	// The model always receives full tool results; this only affects interactive rendering.
-	// Toggle via /lua-toggle-result.
+	// Toggled via the result command.
 	let showToolResultsInUI = false;
 
 	async function ensureStarted(ctx: ExtensionContext) {
 		if (!config) {
-			const path = String(pi.getFlag("lua-config") ?? DEFAULT_CONFIG_PATH);
+			const path = String(pi.getFlag(`${EXTENSION_ID}-config`) ?? DEFAULT_CONFIG_PATH);
+			if (expandHome(path) === DEFAULT_CONFIG_PATH) ensureDefaultConfig();
 			configPathUsed = path;
 			config = loadConfig(path);
 		}
 		await client.start(config, ctx, { configPath: configPathUsed ?? undefined });
-		luaInstructions = client.getInstructions();
+		serverInstructions = client.getInstructions();
 	}
 
 	const isMutatingMcpTool = (tool: McpTool): boolean => {
@@ -772,7 +831,7 @@ export default function (pi: ExtensionAPI) {
 	const registerMcpTools = (ctx: ExtensionContext) => {
 		const tools = client.getTools();
 		if (tools.length === 0) {
-			ctx.ui.notify("lua MCP did not advertise any tools via tools/list", "warning");
+			ctx.ui.notify(`${EXTENSION_ID} MCP did not advertise any tools via tools/list`, "warning");
 			return;
 		}
 
@@ -785,15 +844,15 @@ export default function (pi: ExtensionAPI) {
 				label: tool.name,
 				description:
 					tool.description ??
-					`Execute Lua code${isMutating ? " with mutating operations" : ""} through the lua MCP server.`,
-				parameters: (tool.inputSchema ?? luaSchema) as typeof luaSchema,
+					`Execute code${isMutating ? " with mutating operations" : ""} through the MCP server.`,
+				parameters: (tool.inputSchema ?? toolSchema) as typeof toolSchema,
 				execute: async (_id, params, _signal, _onUpdate, execCtx) =>
-					callLuaTool(tool.name, params as LuaToolArgs, execCtx, isMutating),
+					callMcpTool(tool.name, params as McpToolArgs, execCtx, isMutating),
 				renderCall: (args, theme, context) =>
 					isMutating
-						? renderLuaToolCallFull(tool.name, args, theme, context)
-						: renderLuaToolCallReadOnly(tool.name, args, theme, context),
-				renderResult: (result, _options, theme) => renderLuaToolResult(result, theme),
+						? renderToolCallFull(tool.name, args, theme, context)
+						: renderToolCallReadOnly(tool.name, args, theme, context),
+				renderResult: (result, _options, theme) => renderToolResult(result, theme),
 			});
 		}
 	};
@@ -806,20 +865,20 @@ export default function (pi: ExtensionAPI) {
 			const msg = toErrorMessage(e);
 			// client.start() already notifies for common spawn errors (ENOENT, permissions, ...).
 			if (!client.getUnavailableReason()) {
-				ctx.ui.notify(`lua MCP init failed: ${msg}`, "error");
+				ctx.ui.notify(`${EXTENSION_ID} MCP init failed: ${msg}`, "error");
 			}
 		}
 	});
 
-	// Inject lua's initialize.instructions into model context by appending it to the system prompt.
+	// Inject server initialize.instructions into model context by appending them to the system prompt.
 	pi.on("before_agent_start", async (event) => {
-		if (!luaInstructions || !luaInstructions.trim()) return;
+		if (!serverInstructions || !serverInstructions.trim()) return;
 		return {
 			systemPrompt:
 				event.systemPrompt +
 				"\n\n" +
-				"# lua MCP server instructions (from initialize)\n" +
-				luaInstructions.trim() +
+				`# ${EXTENSION_ID} MCP server instructions (from initialize)\n` +
+				serverInstructions.trim() +
 				"\n",
 		};
 	});
@@ -828,19 +887,19 @@ export default function (pi: ExtensionAPI) {
 		client.stop();
 	});
 
-	pi.registerCommand("lua-session", {
-		description: "Show current lua session id",
+	pi.registerCommand(`${EXTENSION_ID}-session`, {
+		description: `Show current ${EXTENSION_ID} session id`,
 		handler: async (_args, ctx) => {
-			ctx.ui.notify(`lua session_id: ${currentSessionId ?? "(none yet)"}`, "info");
+			ctx.ui.notify(`${EXTENSION_ID} session_id: ${currentSessionId ?? "(none yet)"}`, "info");
 		},
 	});
 
-	pi.registerCommand("lua-restart", {
-		description: "Restart lua MCP process (drops in-memory state)",
+	pi.registerCommand(`${EXTENSION_ID}-restart`, {
+		description: `Restart ${EXTENSION_ID} MCP process (drops in-memory state)`,
 		handler: async (_args, ctx) => {
 			const ok = await ctx.ui.confirm(
-				"Restart lua MCP?",
-				"This will restart the lua MCP process and lose in-memory session state.",
+				`Restart ${EXTENSION_ID} MCP?`,
+				`This will restart the ${EXTENSION_ID} MCP process and lose in-memory session state.`,
 			);
 			if (!ok) return;
 			client.stop();
@@ -853,7 +912,7 @@ export default function (pi: ExtensionAPI) {
 			} catch (e: unknown) {
 				const msg = toErrorMessage(e);
 				if (!client.getUnavailableReason()) {
-					ctx.ui.notify(`lua restart failed: ${msg}`, "error");
+					ctx.ui.notify(`${EXTENSION_ID} restart failed: ${msg}`, "error");
 				}
 			}
 		},
@@ -862,27 +921,27 @@ export default function (pi: ExtensionAPI) {
 	const toggleReadOnlyPreview = (ctx: ExtensionContext) => {
 		showReadOnlyFullPreview = !showReadOnlyFullPreview;
 		ctx.ui.notify(
-			`lua read-only tool preview: ${showReadOnlyFullPreview ? "full" : "truncated"}`,
+			`${EXTENSION_ID} read-only tool preview: ${showReadOnlyFullPreview ? "full" : "truncated"}`,
 			"info",
 		);
 	};
 
-	pi.registerCommand("lua-toggle-preview", {
-		description: "Toggle lua read-only tool-call preview between truncated and full",
+	pi.registerCommand(`${EXTENSION_ID}-toggle-preview`, {
+		description: `Toggle ${EXTENSION_ID} read-only tool-call preview between truncated and full`,
 		handler: async (_args, ctx) => toggleReadOnlyPreview(ctx),
 	});
 
-	pi.registerCommand("lua-toggle-result", {
-		description: "Toggle whether the UI shows lua tool results/output (model always receives full results)",
+	pi.registerCommand(`${EXTENSION_ID}-toggle-result`, {
+		description: `Toggle whether the UI shows ${EXTENSION_ID} tool results/output (model always receives full results)`,
 		handler: async (_args, ctx) => {
 			showToolResultsInUI = !showToolResultsInUI;
-			ctx.ui.notify(`lua tool results (UI): ${showToolResultsInUI ? "shown" : "suppressed"}`, "info");
+			ctx.ui.notify(`${EXTENSION_ID} tool results (UI): ${showToolResultsInUI ? "shown" : "suppressed"}`, "info");
 		},
 	});
 
-	async function callLuaTool(
+	async function callMcpTool(
 		toolName: string,
-		params: LuaToolArgs,
+		params: McpToolArgs,
 		ctx: ExtensionContext,
 		isMutating: boolean,
 	): Promise<AgentToolResult<unknown>> {
@@ -895,7 +954,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: `error: ${reason}` }],
 				details: {
-					lua: {
+					mcp: {
 						toolName,
 						session_id: currentSessionId,
 						rawText,
@@ -905,11 +964,11 @@ export default function (pi: ExtensionAPI) {
 		}
 		client.setContext(ctx);
 
-		const args: LuaToolArgs = { ...params };
+		const args: McpToolArgs = { ...params };
 		// auto-inject session_id if not provided
 		if (!args.session_id && currentSessionId) args.session_id = currentSessionId;
 
-		// lua only includes a truncated code summary in elicitation.message; keep the full code around
+		// The server only includes a truncated code summary in elicitation.message; keep the full code around
 		// while the mutating call is in-flight so the approval UI can show it.
 		if (isMutating) {
 			client.setPendingMutatingCode(args.code);
@@ -946,14 +1005,13 @@ export default function (pi: ExtensionAPI) {
 				summary += `\nconfirmation: ${JSON.stringify(parsed["confirmation"])}`;
 			if (parsed["error"] !== undefined) summary += `\nerror: ${String(parsed["error"])}`;
 
-			// Some backends may include a markdown echo of the executed Lua code in `output`.
+			// Some backends may include a markdown echo of the executed code in `output`.
 			// That is redundant (the tool call already renders the code nicely), and it can cause the LLM
 			// to re-print the same code block in its response.
 			if (parsed["output"] !== undefined && parsed["output"] !== null) {
 				const outStr = String(parsed["output"]);
-				const looksLikeLuaEcho =
-					outStr.includes("```lua") || (args.code.trim().length > 0 && outStr.includes(args.code.trim()));
-				if (!looksLikeLuaEcho) {
+				const looksLikeCodeEcho = args.code.trim().length > 0 && outStr.includes(args.code.trim());
+				if (!looksLikeCodeEcho) {
 					summary += `\n\noutput:\n${outStr}`;
 				}
 			}
@@ -968,7 +1026,7 @@ export default function (pi: ExtensionAPI) {
 		return {
 			content: [{ type: "text", text: summary || text }],
 			details: {
-				lua: {
+				mcp: {
 					toolName,
 					session_id: currentSessionId,
 					rawText: text,
@@ -979,7 +1037,7 @@ export default function (pi: ExtensionAPI) {
 
 	const formatDuration = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
 
-	const syncLuaToolCallTiming = (state: LuaRenderState, context: LuaToolRenderContext) => {
+	const syncToolCallTiming = (state: ToolRenderState, context: ToolRenderContext) => {
 		if (context.executionStarted && state.startedAt === undefined) {
 			state.startedAt = Date.now();
 			state.endedAt = undefined;
@@ -998,14 +1056,14 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const getLuaToolCallTimingLine = (theme: Theme, state: LuaRenderState, context: LuaToolRenderContext) => {
+	const getToolCallTimingLine = (theme: Theme, state: ToolRenderState, context: ToolRenderContext) => {
 		if (state.startedAt === undefined) return null;
 		const label = context.isPartial && !context.isError ? "Elapsed" : "Took";
 		const endTime = state.endedAt ?? Date.now();
 		return theme.fg("muted", `${label} ${formatDuration(endTime - state.startedAt)}`);
 	};
 
-	const getLuaToolCallHeader = (toolName: string, args: unknown, theme: Theme) => {
+	const getToolCallHeader = (toolName: string, args: unknown, theme: Theme) => {
 		const argRec = isRecord(args) ? args : {};
 		const sessionId = typeof argRec["session_id"] === "string" ? argRec["session_id"] : null;
 		const session = sessionId ? `session_id=${sessionId}` : "session_id=(auto)";
@@ -1018,16 +1076,16 @@ export default function (pi: ExtensionAPI) {
 		return header;
 	};
 
-	const renderLuaToolCallFull = (
+	const renderToolCallFull = (
 		toolName: string,
 		args: unknown,
 		theme: Theme,
-		context: LuaToolRenderContext,
+		context: ToolRenderContext,
 	) => {
 		const state = context.state;
-		syncLuaToolCallTiming(state, context);
+		syncToolCallTiming(state, context);
 
-		const header = getLuaToolCallHeader(toolName, args, theme);
+		const header = getToolCallHeader(toolName, args, theme);
 		const argRec = isRecord(args) ? args : {};
 		const code = typeof argRec["code"] === "string" ? argRec["code"] : "";
 		const border = (s: string) => theme.fg("mdCodeBlockBorder", s);
@@ -1044,7 +1102,7 @@ export default function (pi: ExtensionAPI) {
 					const top = border("┌" + "─".repeat(inner) + "┐");
 					const bottom = border("└" + "─".repeat(inner) + "┘");
 
-					const highlighted = highlightCode(code, "lua");
+					const highlighted = highlightCode(code);
 					const rawLines = Array.isArray(highlighted)
 						? highlighted
 						: String(highlighted ?? "").split("\n");
@@ -1058,7 +1116,7 @@ export default function (pi: ExtensionAPI) {
 					lines.push(bottom);
 				}
 
-				const timing = getLuaToolCallTimingLine(theme, state, context);
+				const timing = getToolCallTimingLine(theme, state, context);
 				if (timing) lines.push(timing);
 
 				return lines;
@@ -1066,16 +1124,16 @@ export default function (pi: ExtensionAPI) {
 		};
 	};
 
-	const renderLuaToolCallReadOnly = (
+	const renderToolCallReadOnly = (
 		toolName: string,
 		args: unknown,
 		theme: Theme,
-		context: LuaToolRenderContext,
+		context: ToolRenderContext,
 	) => {
 		const state = context.state;
-		syncLuaToolCallTiming(state, context);
+		syncToolCallTiming(state, context);
 
-		const header = getLuaToolCallHeader(toolName, args, theme);
+		const header = getToolCallHeader(toolName, args, theme);
 		const argRec = isRecord(args) ? args : {};
 		const code = typeof argRec["code"] === "string" ? argRec["code"] : "";
 		const border = (s: string) => theme.fg("mdCodeBlockBorder", s);
@@ -1094,7 +1152,7 @@ export default function (pi: ExtensionAPI) {
 					const top = border("┌" + "─".repeat(inner) + "┐");
 					const bottom = border("└" + "─".repeat(inner) + "┘");
 
-					const highlighted = highlightCode(code, "lua");
+					const highlighted = highlightCode(code);
 					const rawLines = Array.isArray(highlighted)
 						? highlighted
 						: String(highlighted ?? "").split("\n");
@@ -1115,14 +1173,14 @@ export default function (pi: ExtensionAPI) {
 							theme.fg(
 								"dim",
 								expanded
-									? "Preview: full (run /lua-toggle-preview to collapse)"
-									: "Preview: truncated (run /lua-toggle-preview to expand)",
+									? `Preview: full (run /${EXTENSION_ID}-toggle-preview to collapse)`
+									: `Preview: truncated (run /${EXTENSION_ID}-toggle-preview to expand)`,
 							),
 						);
 					}
 				}
 
-				const timing = getLuaToolCallTimingLine(theme, state, context);
+				const timing = getToolCallTimingLine(theme, state, context);
 				if (timing) lines.push(timing);
 
 				return lines;
@@ -1130,12 +1188,12 @@ export default function (pi: ExtensionAPI) {
 		};
 	};
 
-	const renderLuaToolResult = (result: unknown, _theme: Theme) => {
+	const renderToolResult = (result: unknown, _theme: Theme) => {
 		const rawText =
 			isRecord(result) &&
 			isRecord(result["details"]) &&
-			isRecord(result["details"]["lua"])
-				? result["details"]["lua"]["rawText"]
+			isRecord(result["details"]["mcp"])
+				? result["details"]["mcp"]["rawText"]
 				: undefined;
 
 		let parsed: unknown = null;
@@ -1171,7 +1229,7 @@ export default function (pi: ExtensionAPI) {
 				if (parsed["output"] !== undefined) txt += `\n\noutput:\n${String(parsed["output"])}`;
 				if (parsed["result"] !== undefined) txt += `\n\nresult:\n${JSON.stringify(parsed["result"], null, 2)}`;
 				if (parsed["output"] !== undefined || parsed["result"] !== undefined) {
-					txt += `\n\n(run /lua-toggle-result to hide)`;
+					txt += `\n\n(run /${EXTENSION_ID}-toggle-result to hide)`;
 				}
 				return txt;
 			}
@@ -1180,7 +1238,7 @@ export default function (pi: ExtensionAPI) {
 			if (parsed["output"] !== undefined) suppressed.push(`output ${describeValue(parsed["output"])}`);
 			if (parsed["result"] !== undefined) suppressed.push(`result ${describeValue(parsed["result"])}`);
 			if (suppressed.length > 0) {
-				txt += `\n\n(suppressed: ${suppressed.join(", ")}; run /lua-toggle-result to show)`;
+				txt += `\n\n(suppressed: ${suppressed.join(", ")}; run /${EXTENSION_ID}-toggle-result to show)`;
 			}
 			return txt;
 		};

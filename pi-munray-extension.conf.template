@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/path/to/your/mcp-server",
+    "mcp"
+  ]
+
+  // Add a comma after the command array and uncomment this block to configure services.
+  // ,
+  // "environment": {
+  //   "SERVICE_BASE_URL": "https://service.example.com",
+  //   "SERVICE_EMAIL": "you@example.com",
+  //   "SERVICE_API_TOKEN": "{file:~/.config/service-api-token}"
+  // }
+}
