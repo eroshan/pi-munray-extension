@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/Users/misha/Documents/lua-mcp/target/release/lua-mcp",
+    "mcp",
+    "--logs-dir",
+    "/Users/misha/Documents/lua-mcp/logs"
+  ],
+  "environment": {
+    "JIRA_BASE_URL": "https://five9inc.atlassian.net",
+    "JIRA_EMAIL": "mikhail.egorov@five9.com",
+    "JIRA_API_TOKEN": "{file:~/mejt}",
+    "CONFLUENCE_BASE_URL": "https://five9inc.atlassian.net"
+  }
+}
