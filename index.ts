@@ -252,22 +252,29 @@ class McpStdioClient {
 		this.child = child;
 
 		child.on("exit", (code, signal) => {
+			// session_shutdown() clears this.child before terminating the process. The exit event may
+			// arrive after the session has been replaced, when ctx is stale and must not be used.
+			if (this.child !== child) return;
+
 			const msg = `${EXTENSION_ID} MCP exited (code=${code}, signal=${signal ?? ""})`;
 			this.rejectAllPending(new Error(msg));
 			this.initialized = false;
 			this.initInstructions = null;
 			this.serverInfo = null;
 			this.mcpTools = [];
-			if (this.child === child) this.child = null;
+			this.child = null;
 			this.unavailableReason = msg;
 			ctx.ui.setStatus(extensionName, `${EXTENSION_ID} MCP: disconnected`);
 		});
 
 		child.stdout.setEncoding("utf-8");
-		child.stdout.on("data", (chunk: string) => this.onData(chunk));
+		child.stdout.on("data", (chunk: string) => {
+			if (this.child === child) this.onData(chunk);
+		});
 
 		child.stderr.setEncoding("utf-8");
 		child.stderr.on("data", (chunk: string) => {
+			if (this.child !== child) return;
 			// stderr is for debugging; keep it short in the footer.
 			ctx.ui.setStatus(extensionName, `${EXTENSION_ID} stderr: ${String(chunk).trim().slice(0, 120)}`);
 		});
@@ -293,7 +300,9 @@ class McpStdioClient {
 		}
 
 		// Also handle any later process-level errors (rare, but don't crash the whole Pi session).
-		child.on("error", (e: unknown) => this.handleChildFatal(e, ctx, cmd, meta?.configPath));
+		child.on("error", (e: unknown) => {
+			if (this.child === child) this.handleChildFatal(e, ctx, cmd, meta?.configPath);
+		});
 
 		try {
 			await this.initialize(ctx);
@@ -306,14 +315,18 @@ class McpStdioClient {
 	}
 
 	stop() {
-		if (!this.child) return;
+		const child = this.child;
+		if (!child) return;
+		// Invalidate process callbacks before kill() emits its asynchronous exit/error events.
+		this.child = null;
+		this.lastCtx = null;
+		this.pendingMutatingCode = null;
 		this.rejectAllPending(new Error(`${EXTENSION_ID} MCP stopped`));
 		try {
-			this.child.kill();
+			child.kill();
 		} catch {
 			// ignore
 		}
-		this.child = null;
 		this.initialized = false;
 		this.initInstructions = null;
 		this.serverInfo = null;
