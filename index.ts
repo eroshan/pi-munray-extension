@@ -202,18 +202,31 @@ class McpStdioClient {
 	private unavailableReason: string | null = null;
 	private lastFatalNotified: string | null = null;
 
-	// When executing a mutating tool, the server may send a truncated code preview in elicitation.message.
-	// We keep the full code here so the approval UI can show an expandable full preview.
-	private pendingMutatingCode: string | null = null;
+	// When exactly one mutating tool is in flight, retain its full code so the approval UI can
+	// expand the server's truncated preview. With concurrent calls there is no MCP correlation
+	// between an elicitation and tools/call, so fall back to the request's own preview.
+	private pendingMutatingCodes = new Map<symbol, string>();
+
+	// Pi can display only one custom dialog at a time. Serialize server-initiated elicitations
+	// so every JSON-RPC request eventually receives a response.
+	private elicitationQueue: Promise<void> = Promise.resolve();
 
 	constructor(private _pi: ExtensionAPI) {}
 
-	setPendingMutatingCode(code: string | null) {
-		this.pendingMutatingCode = code;
+	addPendingMutatingCode(code: string): symbol {
+		const token = Symbol("mutating tool call");
+		this.pendingMutatingCodes.set(token, code);
+		return token;
+	}
+
+	removePendingMutatingCode(token: symbol) {
+		this.pendingMutatingCodes.delete(token);
 	}
 
 	getPendingMutatingCode(): string | null {
-		return this.pendingMutatingCode;
+		return this.pendingMutatingCodes.size === 1
+			? (this.pendingMutatingCodes.values().next().value ?? null)
+			: null;
 	}
 
 	setContext(ctx: ExtensionContext | null) {
@@ -320,7 +333,7 @@ class McpStdioClient {
 		// Invalidate process callbacks before kill() emits its asynchronous exit/error events.
 		this.child = null;
 		this.lastCtx = null;
-		this.pendingMutatingCode = null;
+		this.pendingMutatingCodes.clear();
 		this.rejectAllPending(new Error(`${EXTENSION_ID} MCP stopped`));
 		try {
 			child.kill();
@@ -460,8 +473,13 @@ class McpStdioClient {
 		this.child.stdin.write(JSON.stringify(req) + "\n");
 	}
 
-	private async respond(id: JsonRpcId | null | undefined, result?: unknown, error?: { code: number; message: string; data?: unknown }) {
-		if (!this.child) return;
+	private async respond(
+		id: JsonRpcId | null | undefined,
+		result?: unknown,
+		error?: { code: number; message: string; data?: unknown },
+		expectedChild?: ChildProcessWithoutNullStreams | null,
+	) {
+		if (!this.child || (expectedChild && this.child !== expectedChild)) return;
 		const resp: JsonRpcResponse = {
 			jsonrpc: "2.0",
 			id: id ?? null,
@@ -547,6 +565,22 @@ class McpStdioClient {
 
 	private async handleElicitationCreate(req: unknown) {
 		const ctx = this.lastCtx;
+		const child = this.child;
+		const pendingCode = this.getPendingMutatingCode();
+
+		const task = this.elicitationQueue
+			.catch(() => undefined)
+			.then(() => this.showElicitationCreate(req, ctx, child, pendingCode));
+		this.elicitationQueue = task;
+		await task;
+	}
+
+	private async showElicitationCreate(
+		req: unknown,
+		ctx: ExtensionContext | null,
+		child: ChildProcessWithoutNullStreams | null,
+		pendingCode: string | null,
+	) {
 		const reqId =
 			isRecord(req) && (typeof req["id"] === "number" || typeof req["id"] === "string") ? (req["id"] as JsonRpcId) : null;
 		const params = isRecord(req) ? req["params"] : null;
@@ -554,14 +588,14 @@ class McpStdioClient {
 			isRecord(params) && typeof params["message"] === "string" ? String(params["message"]) : "Mutating operation requested.";
 
 		if (!ctx || !ctx.hasUI) {
-			await this.respond(reqId, undefined, { code: -32603, message: "No UI available for elicitation" });
+			await this.respond(reqId, undefined, { code: -32603, message: "No UI available for elicitation" }, child);
 			return;
 		}
 
 		// Custom dialog with formatted message + highlighted Extension code preview.
 		const mdTheme = getMarkdownTheme();
 		const parsedMsg = this.parseElicitationMessage(message);
-		const codeForPanels = this.getPendingMutatingCode() ?? parsedMsg.code;
+		const codeForPanels = pendingCode ?? parsedMsg.code;
 
 		// Emit a Pi inter-extension event so other extensions (e.g. a terminal notifier)
 		// can react to approval prompts.
@@ -744,19 +778,19 @@ class McpStdioClient {
 
 		if (choice === "approve") {
 			emitResolve("approve");
-			await this.respond(reqId, { action: "accept", content: { decision: "Approve" } });
+			await this.respond(reqId, { action: "accept", content: { decision: "Approve" } }, undefined, child);
 			return;
 		}
 
 		if (choice === "reject") {
 			emitResolve("reject");
-			await this.respond(reqId, { action: "decline" });
+			await this.respond(reqId, { action: "decline" }, undefined, child);
 			return;
 		}
 
 		// Esc/cancel
 		emitResolve("cancel");
-		await this.respond(reqId, { action: "cancel" });
+		await this.respond(reqId, { action: "cancel" }, undefined, child);
 	}
 }
 
@@ -983,17 +1017,13 @@ export default function (pi: ExtensionAPI) {
 
 		// The server only includes a truncated code summary in elicitation.message; keep the full code around
 		// while the mutating call is in-flight so the approval UI can show it.
-		if (isMutating) {
-			client.setPendingMutatingCode(args.code);
-		}
+		const pendingCodeToken = isMutating ? client.addPendingMutatingCode(args.code) : null;
 
 		let result: unknown;
 		try {
 			result = await client.request("tools/call", { name: toolName, arguments: args });
 		} finally {
-			if (isMutating) {
-				client.setPendingMutatingCode(null);
-			}
+			if (pendingCodeToken) client.removePendingMutatingCode(pendingCodeToken);
 		}
 
 		const text = extractTextContent(result);
