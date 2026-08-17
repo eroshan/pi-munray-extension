@@ -633,7 +633,7 @@ class McpStdioClient {
 						const top = border("┌" + "─".repeat(inner) + "┐");
 						const bottom = border("└" + "─".repeat(inner) + "┘");
 
-						const highlighted = highlightCode(code);
+						const highlighted = highlightCode(code, "lua");
 						const rawLines = Array.isArray(highlighted)
 							? highlighted
 							: String(highlighted ?? "").split("\n");
@@ -708,7 +708,7 @@ class McpStdioClient {
 						const top = border("┌" + "─".repeat(inner) + "┐");
 						const bottom = border("└" + "─".repeat(inner) + "┘");
 
-						const highlighted = highlightCode(code);
+						const highlighted = highlightCode(code, "lua");
 						const rawLines = Array.isArray(highlighted)
 							? highlighted
 							: String(highlighted ?? "").split("\n");
@@ -1145,7 +1145,7 @@ export default function (pi: ExtensionAPI) {
 					const top = border("┌" + "─".repeat(inner) + "┐");
 					const bottom = border("└" + "─".repeat(inner) + "┘");
 
-					const highlighted = highlightCode(code);
+					const highlighted = highlightCode(code, "lua");
 					const rawLines = Array.isArray(highlighted)
 						? highlighted
 						: String(highlighted ?? "").split("\n");
@@ -1195,7 +1195,7 @@ export default function (pi: ExtensionAPI) {
 					const top = border("┌" + "─".repeat(inner) + "┐");
 					const bottom = border("└" + "─".repeat(inner) + "┘");
 
-					const highlighted = highlightCode(code);
+					const highlighted = highlightCode(code, "lua");
 					const rawLines = Array.isArray(highlighted)
 						? highlighted
 						: String(highlighted ?? "").split("\n");
