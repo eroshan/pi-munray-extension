@@ -79,9 +79,21 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 	return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
+function formatUnknown(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (value === undefined) return "undefined";
+	try {
+		const encoded = JSON.stringify(value, null, 2);
+		if (encoded !== undefined) return encoded;
+	} catch {
+		// Fall back for non-JSON values; parsed MCP payloads normally never reach this path.
+	}
+	return String(value);
+}
+
 function toErrorMessage(e: unknown): string {
 	if (e instanceof Error) return e.message;
-	return typeof e === "string" ? e : String(e);
+	return formatUnknown(e);
 }
 
 function parseFileRef(value: string): { type: "file"; path: string } | null {
@@ -1046,7 +1058,7 @@ export default function (pi: ExtensionAPI) {
 			if (parsed["warnings"] !== undefined) summary += `\nwarnings: ${JSON.stringify(parsed["warnings"])}`;
 			if (parsed["confirmation"] !== undefined)
 				summary += `\nconfirmation: ${JSON.stringify(parsed["confirmation"])}`;
-			if (parsed["error"] !== undefined) summary += `\nerror: ${String(parsed["error"])}`;
+			if (parsed["error"] !== undefined) summary += `\nerror: ${formatUnknown(parsed["error"])}`;
 
 			// Some backends may include a markdown echo of the executed code in `output`.
 			// That is redundant (the tool call already renders the code nicely), and it can cause the LLM
@@ -1266,7 +1278,7 @@ export default function (pi: ExtensionAPI) {
 			if (parsed["warnings"] !== undefined) txt += `\nwarnings: ${JSON.stringify(parsed["warnings"])}`;
 			if (parsed["confirmation"] !== undefined)
 				txt += `\nconfirmation: ${JSON.stringify(parsed["confirmation"])}`;
-			if (parsed["error"] !== undefined) txt += `\nerror: ${String(parsed["error"])}`;
+			if (parsed["error"] !== undefined) txt += `\nerror: ${formatUnknown(parsed["error"])}`;
 
 			if (showToolResultsInUI) {
 				if (parsed["output"] !== undefined) txt += `\n\noutput:\n${String(parsed["output"])}`;
